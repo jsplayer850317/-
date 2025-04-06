@@ -1,0 +1,1217 @@
+
+// 通过此文件学习编写PE相关代码
+// PE是以后掌握游戏安全技术的基础 一定要充分理解PE文件结构
+#include<Windows.h>
+#include<stdio.h>
+
+#define debug		1
+#define X64_VER     0
+#define CODESIZE    18
+#define MESSAGEBOXADDR  0x770B0720 // MessageBox函数的地址
+// user32.dll 基址：0x75AA0000  offset = 0x80720 每次重启电脑 该地址都不一样 但是偏移是固定的
+// 0x75B20720-0x75AA0000=0x80720       
+
+char lpFileName[] = "D:/testdll/notepad.exe";
+char lpNewFileName[] = "D:/testdll/notepad_new.exe";
+//char lpDllFile[] = "D:/testdll/DynamicLinkLibrary.dll";
+//char lpNewDllFile[] = "D:/testdll/DynamicLinkLibrary2.dll";
+char lpDllFile[] = "D:/testdll/1.dll";
+char lpNewDllFile[] = "D:/testdll/2.dll";
+
+// shellcode
+char ShellCode[CODESIZE] = {
+    0x6A,00,0x6A,00,0x6A,00,0x6A,00,0xE8,00,00,00,00,0xE9,00,00,00,00
+};
+
+// 磁盘文件转成FileBuffer
+DWORD ReadPEFile(IN LPSTR lpszFileName, OUT LPVOID* pFileBuffer)
+{
+    DWORD dwFileSize = 0;   // 文件大小
+    // 获取文件句柄
+    HANDLE hFile = CreateFileA(lpszFileName, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_READONLY, NULL);
+    // 判断文件句柄是否为0
+    if (hFile == INVALID_HANDLE_VALUE)
+    {
+        printf("文件加载失败，错误代码：%d\n", GetLastError());
+        return 0;
+    }
+    dwFileSize = GetFileSize(hFile, NULL);
+    printf("该文件大小：%u 字节\n", dwFileSize);
+    // 为缓冲区分配内存
+    *pFileBuffer = malloc(dwFileSize);
+    if (!*pFileBuffer)
+    {
+        printf("文件缓冲区创建失败！错误代码：%u\r\n", GetLastError());
+        return -1;
+    }
+    memset(*pFileBuffer, 0, dwFileSize);
+    DWORD lpNumberOfBytesRead;
+    BOOL result = ReadFile(hFile, *pFileBuffer, dwFileSize, &lpNumberOfBytesRead, NULL);
+    if (!result)
+    {
+        CloseHandle(hFile);
+        return 0;
+    }
+    printf("文件读取成功\r\n");
+    CloseHandle(hFile);
+
+    return dwFileSize;
+}
+
+DWORD GetMaxValue(DWORD x, DWORD y)
+{
+    return x > y ? x : y;
+}
+
+/// <summary>
+/// 对齐函数
+/// </summary>
+/// <param name="value"></param>
+/// <param name="n"></param>
+/// <returns></returns>
+int Alignment(int value, int n)
+{
+    if (value % n == 0)
+    {
+        return value;
+    }
+    else
+    {
+        return (value + n) - (value % n);
+    }
+}
+
+// 保存文件
+BOOL SaveData(IN LPVOID buffer, IN const char* filepath, IN DWORD fileSize)
+{
+    HANDLE hFile;
+    char* tmpBuf;
+    DWORD dwBytesWrite, dwBytesToWrite;
+
+    hFile = CreateFile(filepath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE)
+    {
+        printf("create file error!\r\n");   
+        CloseHandle(hFile);
+        return FALSE;
+    }
+
+    dwBytesToWrite = fileSize;
+    dwBytesWrite = 0;
+    tmpBuf = (char*)buffer;
+
+    do
+    {
+        WriteFile(hFile, tmpBuf, dwBytesToWrite, &dwBytesWrite, NULL);
+        dwBytesToWrite -= dwBytesWrite;
+        tmpBuf += dwBytesWrite;
+
+    } while (dwBytesToWrite>0);
+
+    CloseHandle(hFile);
+
+    return TRUE;
+}
+
+// RVA TO OFFSET
+DWORD RvaToOffset(IN LPVOID pFileBuffer, IN DWORD dwRva)
+{
+	DWORD dwFOA = 0;
+	PIMAGE_DOS_HEADER pDosHeader = NULL;
+	PIMAGE_FILE_HEADER pFileHeader = NULL;
+	PIMAGE_OPTIONAL_HEADER pOptionalHeader = NULL;
+	PIMAGE_SECTION_HEADER pSectionHeader = NULL;
+	if (!pFileBuffer) {
+		printf("FileBuffer获取失败!\n");
+		return 0;
+	}
+	if (*((PWORD)pFileBuffer) != IMAGE_DOS_SIGNATURE) {
+		printf("无效的MZ标识\n");
+		return 0;
+	}
+	pDosHeader = (PIMAGE_DOS_HEADER)pFileBuffer;
+	if (*((PDWORD)((DWORD)pFileBuffer + pDosHeader->e_lfanew)) != IMAGE_NT_SIGNATURE) {
+		printf("PE标志错误\r\n");
+		return 0;
+	}
+	pFileHeader = (PIMAGE_FILE_HEADER)(((DWORD)pFileBuffer) + pDosHeader->e_lfanew + 4);
+	//定位可选PE头
+	pOptionalHeader = (PIMAGE_OPTIONAL_HEADER)((DWORD)pFileHeader + IMAGE_SIZEOF_FILE_HEADER);
+	//定位第一个节表
+	pSectionHeader = (PIMAGE_SECTION_HEADER)((DWORD)pOptionalHeader + pFileHeader->SizeOfOptionalHeader);
+
+	BOOL flag = 0;
+	if (dwRva <= pOptionalHeader->SizeOfHeaders)
+	{
+		return dwRva;
+	}
+	for (int i = 0; i < pFileHeader->NumberOfSections; i++)
+	{
+		if (dwRva >= pSectionHeader->VirtualAddress && dwRva < pSectionHeader->VirtualAddress + pSectionHeader->Misc.VirtualSize)
+		{
+			flag = 1;
+			break;
+		}
+		else
+		{
+			pSectionHeader++;
+		}
+	}
+	if (!flag)
+	{
+		return 0;
+	}
+	DWORD offsetOfMemory = dwRva - pSectionHeader->VirtualAddress;
+	dwFOA = pSectionHeader->PointerToRawData + offsetOfMemory;
+	return dwFOA;
+}
+
+// OFFSET TO RVA
+DWORD OffsetToRva(IN LPVOID pFileBuffer, IN DWORD dwFoa)
+{
+    PIMAGE_DOS_HEADER pDosHeader = NULL;
+    PIMAGE_NT_HEADERS pNTHeader = NULL;
+    PIMAGE_FILE_HEADER pPEHeader = NULL;
+    PIMAGE_OPTIONAL_HEADER pOptionHeader = NULL;
+    PIMAGE_SECTION_HEADER pSectionHeader = NULL;
+
+    pDosHeader = (PIMAGE_DOS_HEADER)pFileBuffer;
+    pNTHeader = (PIMAGE_NT_HEADERS)((DWORD)pFileBuffer + pDosHeader->e_lfanew);
+    pPEHeader = (PIMAGE_FILE_HEADER)((DWORD)pNTHeader + 4);
+    pOptionHeader = (PIMAGE_OPTIONAL_HEADER)((DWORD)pPEHeader + IMAGE_SIZEOF_FILE_HEADER);
+    pSectionHeader = (PIMAGE_SECTION_HEADER)((DWORD)pOptionHeader + pPEHeader->SizeOfOptionalHeader);
+
+    PIMAGE_SECTION_HEADER pTempSectionHeader = pSectionHeader;
+    DWORD numOfSec = pPEHeader->NumberOfSections;
+
+    if (dwFoa <= pOptionHeader->SizeOfHeaders)
+    {
+        return dwFoa;
+    }
+    else
+    {
+        for (int i = 0; i < numOfSec; i++) {
+            if (dwFoa >= pSectionHeader[i].PointerToRawData && dwFoa < (pSectionHeader[i].PointerToRawData + pSectionHeader[i].SizeOfRawData)) {
+                return (dwFoa - pSectionHeader[i].PointerToRawData + pSectionHeader[i].VirtualAddress);
+            }
+        }
+    }
+    return 0;
+}
+
+// FileBuffer拉伸成ImageBuffer
+DWORD CoppyFileBufferToImageBuffer(IN LPVOID pFileBuffer, OUT LPVOID* pImageBuffer)
+{
+    DWORD m_dwSizeOfImage = 0;  // ImageBuffer长度
+    LPVOID pTempImageBuffer;    // TempImageBuffer
+    PIMAGE_DOS_HEADER pDosHeader;   // DOS 
+    PIMAGE_NT_HEADERS pNTHeader;    // NT
+    PIMAGE_FILE_HEADER pPEHeader;   // FILE PE
+    PIMAGE_OPTIONAL_HEADER32 pOptionHeader; // OPTIONAL PE
+    PIMAGE_OPTIONAL_HEADER64 pOptionHeader64;   
+    PIMAGE_SECTION_HEADER pSectionHeader;   // SECTION TABLE
+    
+    if (!pFileBuffer)
+    {
+        printf("FileBuffer获取失败\r\n");
+        return 0;
+    }
+    if (*((PWORD)pFileBuffer) != IMAGE_DOS_SIGNATURE)
+    {
+        printf("不是合法的IMAGE_DOS_SIGNATURE标志!\r\n");
+        return 0;
+    }
+    //printf("DOS头标志：0x%X\n", *((PWORD)pFileBuffer));
+
+    if (X64_VER)    // x64程序的ImageBuffer
+    {
+        pDosHeader = (PIMAGE_DOS_HEADER)pFileBuffer;
+        if (*((PDWORD)((DWORD)pFileBuffer + pDosHeader->e_lfanew)) != IMAGE_NT_SIGNATURE)
+        {
+            printf("无效的PE标记\r\n");
+            return 0;
+        }
+        pNTHeader = (PIMAGE_NT_HEADERS)((DWORD)pFileBuffer + pDosHeader->e_lfanew);
+        pPEHeader = (PIMAGE_FILE_HEADER)((DWORD)pNTHeader + 4);
+        pOptionHeader64 = (PIMAGE_OPTIONAL_HEADER64)((DWORD)pPEHeader + IMAGE_SIZEOF_FILE_HEADER);
+        pSectionHeader = (PIMAGE_SECTION_HEADER)((DWORD)pOptionHeader64 + pPEHeader->SizeOfOptionalHeader);
+        m_dwSizeOfImage = pOptionHeader64->SizeOfImage;
+        pTempImageBuffer = malloc(pOptionHeader64->SizeOfImage);
+        if (!pTempImageBuffer) {
+            printf("pTempImageBuffer分配内存失败");
+            return 0;
+        }
+        memset(pTempImageBuffer, 0, pOptionHeader64->SizeOfImage);
+        memcpy(pTempImageBuffer, pFileBuffer, pOptionHeader64->SizeOfHeaders);
+        PIMAGE_SECTION_HEADER pTempSectionHeader = pSectionHeader;
+        for (int i = 0; i < pPEHeader->NumberOfSections; i++)
+        {
+            memcpy(
+                (LPVOID)((DWORD)pTempImageBuffer + pTempSectionHeader->VirtualAddress),
+                (LPVOID)((DWORD)pFileBuffer + pTempSectionHeader->PointerToRawData),
+                pTempSectionHeader->SizeOfRawData
+            );
+            pTempSectionHeader++;
+        }
+        *pImageBuffer = pTempImageBuffer;   // 返回数据
+        pTempImageBuffer = NULL;
+        return m_dwSizeOfImage;
+    }
+    else // x86程序的ImageBuffer
+    {
+        pDosHeader = (PIMAGE_DOS_HEADER)pFileBuffer;
+        if (*((PDWORD)((DWORD)pFileBuffer + pDosHeader->e_lfanew)) != IMAGE_NT_SIGNATURE)
+        {
+            printf("无效的PE标记\r\n");
+            return 0;
+        }
+        pNTHeader = (PIMAGE_NT_HEADERS)((DWORD)pFileBuffer + pDosHeader->e_lfanew);
+        pPEHeader = (PIMAGE_FILE_HEADER)((DWORD)pNTHeader + 4);
+        pOptionHeader = (PIMAGE_OPTIONAL_HEADER32)((DWORD)pPEHeader + IMAGE_SIZEOF_FILE_HEADER);
+        pSectionHeader = (PIMAGE_SECTION_HEADER)((DWORD)pOptionHeader + pPEHeader->SizeOfOptionalHeader);
+        m_dwSizeOfImage = pOptionHeader->SizeOfImage;
+
+        pTempImageBuffer = malloc(pOptionHeader->SizeOfImage);
+        if (!pTempImageBuffer) {
+            printf("pTempImageBuffer分配内存失败");
+            return 0;
+        }
+        memset(pTempImageBuffer, 0, pOptionHeader->SizeOfImage);
+        memcpy(pTempImageBuffer, pFileBuffer, pOptionHeader->SizeOfHeaders);
+        PIMAGE_SECTION_HEADER pTempSectionHeader = pSectionHeader;
+        for (int i = 0; i < pPEHeader->NumberOfSections; i++)
+        {
+            memcpy(
+                (LPVOID)((DWORD)pTempImageBuffer + pTempSectionHeader->VirtualAddress),
+                (LPVOID)((DWORD)pFileBuffer + pTempSectionHeader->PointerToRawData),
+                pTempSectionHeader->SizeOfRawData
+            );
+            pTempSectionHeader++;
+        }
+        *pImageBuffer = pTempImageBuffer;   // 返回数据
+        pTempImageBuffer = NULL;
+
+    }
+ 
+    return m_dwSizeOfImage;
+}
+
+// ImageBuffer转到NewFileBuffer
+DWORD CopyImageBufferToNewBuffer(IN LPVOID pImageBuffer, OUT LPVOID* pNewBuffer)
+{
+    DWORD m_dwSizeOfImage = 0;  // ImageBuffer长度
+    LPVOID pTempNewBuffer;    // TempImageBuffer
+    PIMAGE_DOS_HEADER pDosHeader;   // DOS 
+    PIMAGE_NT_HEADERS pNTHeader;    // NT
+    PIMAGE_FILE_HEADER pPEHeader;   // FILE PE
+    PIMAGE_OPTIONAL_HEADER32 pOptionHeader; // OPTIONAL PE
+    PIMAGE_SECTION_HEADER pSectionHeader;   // SECTION TABLE
+
+    if (!pImageBuffer)
+    {
+        printf("ImageBuffer获取失败\r\n");
+        return 0;
+    }
+    if (*((PWORD)pImageBuffer) != IMAGE_DOS_SIGNATURE)
+    {
+        printf("不是合法的IMAGE_DOS_SIGNATURE标志!\r\n");
+        return 0;
+    }
+    pDosHeader = (PIMAGE_DOS_HEADER)pImageBuffer;
+    if (*((PDWORD)((DWORD)pImageBuffer + pDosHeader->e_lfanew)) != IMAGE_NT_SIGNATURE)
+    {
+        printf("无效的PE标记\r\n");
+        return 0;
+    }
+    pNTHeader = (PIMAGE_NT_HEADERS)((DWORD)pImageBuffer + pDosHeader->e_lfanew);
+    pPEHeader = (PIMAGE_FILE_HEADER)((DWORD)pNTHeader + 4);
+    pOptionHeader = (PIMAGE_OPTIONAL_HEADER32)((DWORD)pPEHeader + IMAGE_SIZEOF_FILE_HEADER);
+    pSectionHeader = (PIMAGE_SECTION_HEADER)((DWORD)pOptionHeader + pPEHeader->SizeOfOptionalHeader);
+    // 计算NewFileBuffer的长度
+    DWORD nFileBufSize = 0;
+    nFileBufSize = pOptionHeader->SizeOfHeaders;
+    for (int i = 0; i < pPEHeader->NumberOfSections; i++)
+    {
+        nFileBufSize += pSectionHeader[i].SizeOfRawData;
+    }
+    // 为NewFileBuffer分配内存
+    pTempNewBuffer = malloc(nFileBufSize);
+    if (!pTempNewBuffer) {
+        printf("pTempNewBuffer分配内存失败");
+        return 0;
+    }
+    memset(pTempNewBuffer, 0, nFileBufSize);
+    memcpy(pTempNewBuffer, pDosHeader, pOptionHeader->SizeOfHeaders);
+    PIMAGE_SECTION_HEADER pTempSectionHeader = pSectionHeader;
+    for (int i = 0; i < pPEHeader->NumberOfSections; i++, pTempSectionHeader++)
+    {
+        printf("PointerToRawData:%p\n", pTempSectionHeader->PointerToRawData);
+        memcpy((LPVOID)((DWORD)pTempNewBuffer + pTempSectionHeader->PointerToRawData),
+            (LPVOID)((DWORD)pImageBuffer + pTempSectionHeader->VirtualAddress),
+            pTempSectionHeader->SizeOfRawData);
+    }
+    *pNewBuffer = pTempNewBuffer;
+    return nFileBufSize;
+}
+
+// 在exe中的代码节添加并执行代码
+VOID AddCode(IN LPVOID pFileBuffer, IN DWORD nSec, IN const char* shellcode)
+{
+
+    LPVOID pImageBuffer;
+    LPVOID pNewBuffer;
+    PIMAGE_DOS_HEADER pDosHeader;   // DOS 
+    PIMAGE_NT_HEADERS pNTHeader;    // NT
+    PIMAGE_FILE_HEADER pPEHeader;   // FILE PE
+    PIMAGE_OPTIONAL_HEADER32 pOptionHeader; // OPTIONAL PE
+    PIMAGE_SECTION_HEADER pSectionHeader;   // SECTION TABLE
+    PIMAGE_SECTION_HEADER pTempSectionHeader; 
+
+    if (!pFileBuffer)
+    {
+        printf("FileBuffer获取失败\r\n");
+        free(pFileBuffer);
+        return;
+    }
+
+    if (*((PWORD)pFileBuffer) != IMAGE_DOS_SIGNATURE)
+    {
+        printf("不是合法的IMAGE_DOS_SIGNATURE标志!\r\n");
+        free(pFileBuffer);
+        return;
+    }
+    // FileBuffer被先转成ImageBuffer
+    DWORD sizeOfImageBuffer = CoppyFileBufferToImageBuffer(pFileBuffer, &pImageBuffer);
+    pDosHeader = (PIMAGE_DOS_HEADER)pImageBuffer;
+    if (*((PDWORD)((DWORD)pImageBuffer + pDosHeader->e_lfanew)) != IMAGE_NT_SIGNATURE)
+    {
+        printf("无效的PE标记\r\n");
+        return;
+    }
+
+    pNTHeader = (PIMAGE_NT_HEADERS)((DWORD)pImageBuffer + pDosHeader->e_lfanew);
+    pPEHeader = (PIMAGE_FILE_HEADER)((DWORD)pNTHeader + 4);
+    pOptionHeader = (PIMAGE_OPTIONAL_HEADER32)((DWORD)pPEHeader + IMAGE_SIZEOF_FILE_HEADER);
+    pSectionHeader = (PIMAGE_SECTION_HEADER)((DWORD)pOptionHeader + pPEHeader->SizeOfOptionalHeader);
+  
+    DWORD m_dwCodeSpace = 0; // 添加代码的空闲区大小
+    m_dwCodeSpace = pSectionHeader[nSec-1].SizeOfRawData - pSectionHeader[nSec-1].VirtualAddress;
+    if (m_dwCodeSpace <= CODESIZE)
+    {
+        printf("该节空间不足以插入代码\r\n");
+        free(pFileBuffer);
+        free(pImageBuffer);
+        return;
+    }
+
+    // 代码起始位置
+    PBYTE pCodeBegin = (PBYTE)((DWORD)pImageBuffer + pSectionHeader[nSec-1].VirtualAddress + pSectionHeader[nSec-1].Misc.VirtualSize);
+    // 复制shellcode
+    memcpy(pCodeBegin, ShellCode, CODESIZE);
+
+    // 程序在内存中运行时的起始位置是ImageBase
+    // 真正要跳转的地址 = E8指令的下一条地址 - X
+    // E8指令的下一条地址 = E8 + 5
+    // MessageBox地址 - E8指令的下一个地址 = X
+    // ((DWORD)(pCodeBegin  + 0xD) - (DWORD)pImageBuffer) 是ImageBuffer到E8指令的下一条地址的偏移
+    DWORD callAddr = MESSAGEBOXADDR - (pOptionHeader->ImageBase + ((DWORD)(pCodeBegin  + 0x0D) - (DWORD)pImageBuffer));
+    *(PDWORD)(pCodeBegin + 0x09) = callAddr;	// 修正E8
+    // X = 真正要跳转的地址 - E9指令的下一个地址        
+    DWORD jmpAddr = (pOptionHeader->ImageBase + pOptionHeader->AddressOfEntryPoint) - (pOptionHeader->ImageBase + ((DWORD)(pCodeBegin + CODESIZE) - (DWORD)pImageBuffer));
+    *(PDWORD)(pCodeBegin + 0xE) = jmpAddr;      // 修正E9 jmp 原先的OEP地址
+    // 新的OEP地址
+    pOptionHeader->AddressOfEntryPoint = (DWORD)pCodeBegin - (DWORD)pImageBuffer;
+    pSectionHeader[nSec - 1].Characteristics = 0x60000020;
+
+    // ImageBuffer to NewFileBuffer
+    DWORD size = CopyImageBufferToNewBuffer(pImageBuffer, &pNewBuffer);
+    if (size == 0 || !pNewBuffer) {
+        printf("ImageBuffer-->NewBuffer失败\r\n");
+        free(pFileBuffer);
+        free(pImageBuffer);
+        return;
+    }
+    // 存盘
+    BOOL bRet = SaveData(pNewBuffer,lpNewFileName, size);
+    if (bRet)
+    {
+        printf("保存成功\r\n");
+    }
+    else
+    {
+        printf("保存失败\r\n");
+    }
+    // 释放内存
+    free(pFileBuffer);
+    free(pImageBuffer);
+    free(pNewBuffer);
+}
+
+//为DLL文件增加新节
+DWORD AddNewSec(IN LPVOID pFileBuffer, IN int size, OUT LPVOID* pNewBuffer)
+{
+    LPVOID pTempNewBuffer = NULL;
+    PIMAGE_DOS_HEADER pDosHeader = NULL;
+    PIMAGE_NT_HEADERS pNTHeader = NULL;
+    PIMAGE_FILE_HEADER pPEHeader = NULL;
+    PIMAGE_OPTIONAL_HEADER pOptionHeader = NULL;
+    PIMAGE_SECTION_HEADER pSectionHeader = NULL;
+    PIMAGE_SECTION_HEADER pLastSectionHeader = NULL;
+    PIMAGE_SECTION_HEADER pTempSectionHeader = NULL;
+    DWORD dwSize = 0; // dwSize = pOptionHeader->SizeOfImage + size
+
+
+    pDosHeader = (PIMAGE_DOS_HEADER)pFileBuffer;
+    //定位NT头的地址
+    pNTHeader = (PIMAGE_NT_HEADERS)((DWORD)pFileBuffer + pDosHeader->e_lfanew);
+    //定位标志PE头地址
+    pPEHeader = (PIMAGE_FILE_HEADER)(((DWORD)pNTHeader) + 0x04);//PE SIGNATURE 站4个字节
+    //定位可选PE头地址
+    pOptionHeader = (PIMAGE_OPTIONAL_HEADER32)(((DWORD)pPEHeader) + IMAGE_SIZEOF_FILE_HEADER);//IMAGE_SIZEOF_FILE_HEADER -> 0个节
+    //定位第一个节表地址
+    pSectionHeader = (PIMAGE_SECTION_HEADER)((DWORD)pOptionHeader + pPEHeader->SizeOfOptionalHeader);
+
+    //获取最后一个节表的指针
+    pLastSectionHeader = &pSectionHeader[pPEHeader->NumberOfSections - 1];
+
+    //为newbuffer开辟新的内存空间
+    dwSize = pOptionHeader->SizeOfImage + size;
+    pTempNewBuffer = malloc(dwSize);
+    memset(pTempNewBuffer, 0, dwSize);
+    memcpy(pTempNewBuffer, pDosHeader, dwSize);
+
+
+    //判断是否有足够空间存储新节表
+    DWORD space = (DWORD)(pOptionHeader->SizeOfHeaders - (pDosHeader->e_lfanew + 0x04 + \
+        sizeof(PIMAGE_FILE_HEADER) + pPEHeader->SizeOfOptionalHeader + sizeof(PIMAGE_SECTION_HEADER) \
+        * pPEHeader->NumberOfSections));
+    if (space < 2 * sizeof(PIMAGE_SECTION_HEADER))
+    {
+        printf("文件头剩余空间不够\r\n");
+        return 0;
+    }
+
+    //定位DOS头地址
+    pDosHeader = (PIMAGE_DOS_HEADER)pTempNewBuffer;
+    //定位NT头的地址
+    pNTHeader = (PIMAGE_NT_HEADERS)((DWORD)pTempNewBuffer + pDosHeader->e_lfanew);
+    //定位标志PE头地址
+    pPEHeader = (PIMAGE_FILE_HEADER)(((DWORD)pNTHeader) + 0x04);//PE SIGNATURE 站4个字节
+    //定位可选PE头地址
+    pOptionHeader = (PIMAGE_OPTIONAL_HEADER32)(((DWORD)pPEHeader) + IMAGE_SIZEOF_FILE_HEADER);//IMAGE_SIZEOF_FILE_HEADER -> 0个节
+    //定位第一个节表
+    pSectionHeader = (PIMAGE_SECTION_HEADER)((DWORD)pOptionHeader + pPEHeader->SizeOfOptionalHeader);
+    //获取最后一个节表
+    pLastSectionHeader = &pSectionHeader[pPEHeader->NumberOfSections - 1];
+
+    DWORD numberOfSections = pPEHeader->NumberOfSections; //节表数量
+    PWORD pNumberOfSections = &pPEHeader->NumberOfSections;
+    PDWORD pSizeOfImage = &pOptionHeader->SizeOfImage;
+    DWORD lastCharacteristics = 0x60000020;
+
+    //修改新增加的节表
+    PVOID secName = &pSectionHeader[numberOfSections].Name;
+    PDWORD secVirtualSize = &pSectionHeader[numberOfSections].Misc.VirtualSize; //VirtualSize
+    PDWORD secVirtualAddress = &pSectionHeader[numberOfSections].VirtualAddress; //VirtualAddress
+    PDWORD secSizeOfRawData = &pSectionHeader[numberOfSections].SizeOfRawData; //SizeOfRawData
+    PDWORD secPointerToRawData = &pSectionHeader[numberOfSections].PointerToRawData; //PointerToRawData
+    PDWORD secCharacteristics = &pSectionHeader[numberOfSections].Characteristics; //Characteristics
+
+    memcpy(secName, ".hack", IMAGE_SIZEOF_SHORT_NAME);
+    DWORD x = pSectionHeader[numberOfSections-1].Misc.VirtualSize;
+    *secVirtualSize = Alignment(size, pOptionHeader->SectionAlignment);
+    *secSizeOfRawData = size;
+    *secVirtualAddress = pLastSectionHeader->VirtualAddress + Alignment(x, pOptionHeader->SectionAlignment); //内存对齐
+    printf("Alignment(*secVirtualSize, pOptionHeader->SectionAlignment) : %x\n", Alignment(*secVirtualSize, pOptionHeader->SectionAlignment));
+    *secPointerToRawData = pLastSectionHeader->PointerToRawData + pLastSectionHeader->SizeOfRawData;
+    *secCharacteristics = lastCharacteristics;
+
+    //修改 NumberOfSections
+    *pNumberOfSections = pPEHeader->NumberOfSections + 1;
+
+    //修改 SizeOfImage
+    *pSizeOfImage = pOptionHeader->SizeOfImage + size;
+    numberOfSections = pPEHeader->NumberOfSections;
+    DWORD sizeOfNewBuffer = size + (pSectionHeader + (numberOfSections - 1))->PointerToRawData;
+    printf("SizeOfNewBuffer:%x\n", sizeOfNewBuffer);
+
+    LPVOID pNewFileBuffer = NULL;
+    pNewFileBuffer = malloc(sizeOfNewBuffer);
+    memset(pNewFileBuffer, 0, sizeOfNewBuffer);
+    memcpy(pNewFileBuffer, pDosHeader, sizeOfNewBuffer);
+
+    *pNewBuffer = pNewFileBuffer;
+    pTempNewBuffer = NULL;
+    pNewFileBuffer = NULL;
+
+    return sizeOfNewBuffer;
+}
+
+/// <summary>
+/// 提升PE头新增节
+/// </summary>
+/// <param name="pFileBuffer">PE文件的FileBuffer</param>
+/// <param name="fileSize">FileBuffer的长度</param>
+/// <param name="newSecSize">新节的长度</param>
+/// <param name="pNewFileBuffer">新增节后的FileBuffer</param>
+/// <returns>新增节后的文件长度</returns>
+DWORD 提升PE头新增节(IN LPVOID pFileBuffer, IN DWORD fileSize, IN DWORD newSecSize, OUT LPVOID* pNewFileBuffer)
+{
+    LPVOID pTempNewFileBuffer;
+    DWORD nFileSize = 0;
+    PIMAGE_DOS_HEADER pDosHeader;   // DOS 
+    PIMAGE_NT_HEADERS pNTHeader;    // NT
+    PIMAGE_FILE_HEADER pPEHeader;   // FILE PE
+    PIMAGE_OPTIONAL_HEADER32 pOptionHeader; // OPTIONAL PE
+    PIMAGE_SECTION_HEADER pSectionHeader;   // SECTION TABLE
+
+    if (!pFileBuffer)
+    {
+        printf("FileBuffer获取失败\r\n");
+        free(pFileBuffer);
+        return 0;
+    }
+    if (*((PWORD)pFileBuffer) != IMAGE_DOS_SIGNATURE)
+    {
+        printf("不是合法的IMAGE_DOS_SIGNATURE标志!\r\n");
+        free(pFileBuffer);
+        return 0;
+    }
+    pDosHeader = (PIMAGE_DOS_HEADER)pFileBuffer;
+    if (*((PDWORD)((DWORD)pFileBuffer + pDosHeader->e_lfanew)) != IMAGE_NT_SIGNATURE)
+    {
+        printf("无效的PE标记\r\n");
+        free(pFileBuffer);
+        return 0;
+    }
+  
+    // 提升PE头到DOS_STUB的位置
+    DWORD nDosStub = pDosHeader->e_lfanew - sizeof(IMAGE_DOS_HEADER);
+    memcpy((LPVOID)((DWORD)pFileBuffer + sizeof(IMAGE_DOS_HEADER)), (LPVOID)((DWORD)pFileBuffer + pDosHeader->e_lfanew), 0x170);
+    memset( (LPVOID)((DWORD)pFileBuffer + sizeof(IMAGE_DOS_HEADER) + 0x170), 0, nDosStub);
+    pDosHeader->e_lfanew = sizeof(IMAGE_DOS_HEADER);    // 修正e_lfanew
+    // 定位到各个头部
+    pNTHeader = (PIMAGE_NT_HEADERS)((DWORD)pFileBuffer + sizeof(IMAGE_DOS_HEADER));
+    pPEHeader = (PIMAGE_FILE_HEADER)((DWORD)pNTHeader + 0x04);
+    pOptionHeader = (PIMAGE_OPTIONAL_HEADER32)((DWORD)pPEHeader + IMAGE_SIZEOF_FILE_HEADER);
+    pSectionHeader = (PIMAGE_SECTION_HEADER)((DWORD)pOptionHeader + pPEHeader->SizeOfOptionalHeader);
+
+    // 判断是否有80字节的空间来增加新的节表
+    DWORD space = nDosStub;
+    if (space < 2 * sizeof(PIMAGE_SECTION_HEADER))
+    {
+        printf("文件头剩余空间不够\r\n");
+        free(pFileBuffer);
+        return 0;
+    }
+
+    // 创建新节表 实际上实在pFileBuffer内存中做出的修改  修改后直接把pFileBuffer复制到pNewFileBuffer中
+    PIMAGE_SECTION_HEADER pLastSectionHeader = &pSectionHeader[pPEHeader->NumberOfSections - 1];
+    PIMAGE_SECTION_HEADER pNewSectionHeader = (PIMAGE_SECTION_HEADER)((DWORD)pLastSectionHeader + IMAGE_SIZEOF_SECTION_HEADER); // 新增节表
+    char secName[9] = ".new";
+    memcpy(pNewSectionHeader->Name, secName, 9);
+    pNewSectionHeader->Misc.VirtualSize = newSecSize;
+    pNewSectionHeader->VirtualAddress = pLastSectionHeader->VirtualAddress + pLastSectionHeader->SizeOfRawData;
+    pNewSectionHeader->PointerToRawData = pLastSectionHeader->PointerToRawData + pLastSectionHeader->SizeOfRawData;
+    pNewSectionHeader->SizeOfRawData = newSecSize;
+    pNewSectionHeader->Characteristics = pSectionHeader->Characteristics & 0xFFFFFFFF;
+    pPEHeader->NumberOfSections += 1; //节数量增加1
+    pOptionHeader->SizeOfImage = pOptionHeader->SizeOfImage + newSecSize; //文件大小增加newSize字节大小
+    nFileSize = fileSize + newSecSize;  // 新增节后NewFileBuffer的长度
+ 
+    // 为NewFileBuffer分配内存
+    pTempNewFileBuffer = malloc(nFileSize);
+    if (!pTempNewFileBuffer)
+    {
+        printf("pTempNewFileBuffer创建失败\r\n");
+        free(pFileBuffer);
+        return 0;
+    }
+    memset(pTempNewFileBuffer, 0, nFileSize);   // 内存初始化为0
+    memcpy(pTempNewFileBuffer, pFileBuffer, fileSize);  // 复制FileBuffer到NewFileBuffer
+    *pNewFileBuffer = pTempNewFileBuffer;
+    pTempNewFileBuffer = NULL;
+
+    return nFileSize;
+}
+
+/// <summary>
+/// 扩大最后一个节的容量
+/// </summary>
+/// <param name="pFileBuffer">FileBuffer</param>
+/// <param name="expSize">扩充容量</param>
+/// <param name="pNewFileBuffer">NewFileBuffer</param>
+/// <returns>扩充后的文件长度</returns>
+DWORD SectionExpanded(IN LPVOID pFileBuffer, IN DWORD expSize, OUT LPVOID* pNewBuffer)
+{
+    DWORD nFileSize = 0;
+    LPVOID pImageBuffer;
+    LPVOID pNewImageBuffer;
+    LPVOID pNewFileBuffer;
+    PIMAGE_DOS_HEADER pDosHeader;   // DOS 
+    PIMAGE_NT_HEADERS pNTHeader;    // NT
+    PIMAGE_FILE_HEADER pPEHeader;   // FILE PE
+    PIMAGE_OPTIONAL_HEADER32 pOptionHeader; // OPTIONAL PE
+    PIMAGE_SECTION_HEADER pSectionHeader;   // SECTION TABLE
+
+    // FileBuffer拉伸成ImageBuffer
+    DWORD imgSize = CoppyFileBufferToImageBuffer(pFileBuffer, &pImageBuffer);
+    // 创建NewImageBuffer内存缓冲区
+    pNewImageBuffer = malloc(imgSize+ expSize);
+    memset(pNewImageBuffer, 0, imgSize+ expSize);
+    memcpy(pNewImageBuffer, pImageBuffer, imgSize);
+
+    // 定位各个PE头们
+    pDosHeader = (PIMAGE_DOS_HEADER)pNewImageBuffer;
+    pNTHeader = (PIMAGE_NT_HEADERS)((DWORD)pNewImageBuffer + pDosHeader->e_lfanew);
+    pPEHeader = (PIMAGE_FILE_HEADER)((DWORD)pNTHeader + 4);
+    pOptionHeader = (PIMAGE_OPTIONAL_HEADER32)((DWORD)pPEHeader + IMAGE_SIZEOF_FILE_HEADER);
+    pSectionHeader = (PIMAGE_SECTION_HEADER)((DWORD)pOptionHeader + pPEHeader->SizeOfOptionalHeader);
+    
+    // 定位到最后一个节表
+    PIMAGE_SECTION_HEADER pLastSection = &pSectionHeader[pPEHeader->NumberOfSections - 1];
+   
+    // 修复最后一个节表的SizeOfRawData和VirtualSize属性；修复SizeOfImage
+    DWORD vMax = GetMaxValue(pLastSection->Misc.VirtualSize, pLastSection->SizeOfRawData);
+    int N = Alignment(vMax, pOptionHeader->SectionAlignment);   // 内存对齐后的值
+    N += expSize;
+    pLastSection->Misc.VirtualSize = N;     // 修正最后一节的VirtualSize
+    pLastSection->SizeOfRawData = N;        // 修正最后一节的SizeOfRawData
+    pOptionHeader->SizeOfImage += expSize;  // 修正SizeOfImage
+
+    // ImageBuffer转到NewFileBuffer
+    nFileSize = CopyImageBufferToNewBuffer(pNewImageBuffer, &pNewFileBuffer);
+    *pNewBuffer = pNewFileBuffer;
+    pNewFileBuffer = NULL;
+    free(pFileBuffer);
+    free(pImageBuffer);
+    return nFileSize;
+}
+
+/// <summary>
+/// 列出目录项
+/// </summary>
+/// <param name="pFileBuffer">FileBuffer</param>
+/// <returns>无返回值</returns>
+VOID PrintDataDirectory(IN LPVOID pFileBuffer)
+{
+    PIMAGE_DOS_HEADER pDosHeader = NULL;
+    PIMAGE_NT_HEADERS pNTHeader = NULL;
+    PIMAGE_FILE_HEADER pPEHeader = NULL;
+    PIMAGE_OPTIONAL_HEADER32 pOptionHeader = NULL;
+    PIMAGE_DATA_DIRECTORY pDataDir = NULL;
+
+    if (!pFileBuffer)
+    {
+        printf("FileBuffer获取失败");
+        return;
+    }
+
+    if (*((PWORD)pFileBuffer) != IMAGE_DOS_SIGNATURE)
+    {
+        printf("无效的MZ");
+        return;
+    }
+
+    //获取到DOS头结构
+    pDosHeader = (PIMAGE_DOS_HEADER)pFileBuffer;
+    if (*((PDWORD)((DWORD)pFileBuffer + pDosHeader->e_lfanew)) != IMAGE_NT_SIGNATURE)
+    {
+        printf("无效的PE标记\r\n");
+        return;
+    }
+
+    //NT 头
+    pNTHeader = (PIMAGE_NT_HEADERS)((DWORD)pFileBuffer + pDosHeader->e_lfanew);
+    //标准PE头
+    pPEHeader = (PIMAGE_FILE_HEADER)((DWORD)pNTHeader + 4);
+    //可选头的起始位置 = FILE头起始位置 + FILE头的大小
+    pOptionHeader = (PIMAGE_OPTIONAL_HEADER32)((DWORD)pPEHeader + IMAGE_SIZEOF_FILE_HEADER);
+    //数据目录
+    pDataDir = (PIMAGE_DATA_DIRECTORY)pOptionHeader->DataDirectory;
+
+    LPSTR titles[IMAGE_NUMBEROF_DIRECTORY_ENTRIES] = {
+        (LPSTR)"导出表",
+        (LPSTR)"导入表",
+        (LPSTR)"资源表",
+        (LPSTR)"异常表",
+        (LPSTR)"安全证书表",
+        (LPSTR)"重定位表",
+        (LPSTR)"调试信息表",
+        (LPSTR)"版权所有表",
+        (LPSTR)"全局指针表",
+        (LPSTR)"TLS表",
+        (LPSTR)"加载配置表",
+        (LPSTR)"绑定导入表",
+        (LPSTR)"IAT表",
+        (LPSTR)"延迟导入表",
+        (LPSTR)"COM表",
+        (LPSTR)"保留表"
+    };
+
+    for (int i = 0; i < IMAGE_NUMBEROF_DIRECTORY_ENTRIES; i++)
+    {
+        printf("Title:%s|RVA:%.8X|Size:%X\n", titles[i], pDataDir[i].VirtualAddress, pDataDir[i].Size);
+    }
+    printf("\n\n");
+}
+
+/// <summary>
+/// 打印输出导出表
+/// </summary>
+/// <param name="pFileBuffer">FileBuffer</param>
+/// <returns></returns>
+VOID PrintExportTable(IN LPVOID pFileBuffer)
+{
+    // 找到导出表位置
+    PIMAGE_DOS_HEADER pDos;
+    PIMAGE_NT_HEADERS pNt;
+    PIMAGE_FILE_HEADER pPE;
+    PIMAGE_OPTIONAL_HEADER pOption;
+    PIMAGE_EXPORT_DIRECTORY pExp;
+
+    if (!pFileBuffer)
+    {
+        printf("FileBuffer对象为空，错误代码：%d\r\n",GetLastError());
+        return;
+    }
+
+    if (*((PWORD)pFileBuffer) != IMAGE_DOS_SIGNATURE)
+    {
+        printf("该文件没有MZ标志\r\n");
+        free(pFileBuffer);
+        return;
+    }
+
+    pDos = (PIMAGE_DOS_HEADER)pFileBuffer;
+    pNt = (PIMAGE_NT_HEADERS)((DWORD)pFileBuffer + pDos->e_lfanew);
+    pPE = (PIMAGE_FILE_HEADER)((DWORD)pNt + 0x04);
+    pOption = &pNt->OptionalHeader;
+    if (RvaToOffset(pFileBuffer, pOption->DataDirectory[0].VirtualAddress)== 0)
+    {
+        // 判断该PE文件没有导出表
+        printf("该PE文件没有导出表\r\n");
+        return;
+    }
+    // 有导出表
+    pExp = (PIMAGE_EXPORT_DIRECTORY)((DWORD)pFileBuffer + RvaToOffset(pFileBuffer, pOption->DataDirectory[0].VirtualAddress));
+
+    // 解析导出表结构
+    PDWORD pFuncsAddr = (PDWORD)((DWORD)pFileBuffer + RvaToOffset(pFileBuffer, pExp->AddressOfFunctions));
+    //	该地址存储所有导出函数的名字的地址
+    PDWORD pFuncNamesAddr = (PDWORD)((DWORD)pFileBuffer + RvaToOffset(pFileBuffer, pExp->AddressOfNames));
+    // 该地址存储所有导出函数的序号
+    PWORD pFuncOrdinalsAddr = (PWORD)((DWORD)pFileBuffer + RvaToOffset(pFileBuffer, pExp->AddressOfNameOrdinals));
+    // 打印函数的名字
+    for (int i = 0; i < pExp->NumberOfNames; i++)
+    {
+    	// pszFuncName:导出的函数名称
+    	PCHAR pszFuncName =(PCHAR)((DWORD)pFileBuffer + RvaToOffset(pFileBuffer, *pFuncNamesAddr));
+        printf("函数名称表偏移：%.8X\r\n", RvaToOffset(pFileBuffer, *pFuncNamesAddr));
+    	printf("函数名称:%s\n", pszFuncName);
+    	pFuncNamesAddr++;
+    }
+    // 导出序号表和函数名称表是一样长的 NumberOfNames
+    // 导出序号表中的值加上Base才是真正的导出序号
+    for (int i = 0; i < pExp->NumberOfNames; i++)
+    {
+    	printf("函数序号:0x%.4x\n", pExp->Base + *(pFuncOrdinalsAddr + i));
+    }
+    // 打印函数地址表
+    for (int i = 0; i < pExp->NumberOfFunctions; i++)
+    {
+    	printf("函数地址:0x%.8X\n", *pFuncsAddr);
+    	pFuncsAddr++;
+    }
+    printf("导出表解析完成!\r\n");
+}
+
+/// <summary>
+/// 以函数名导出函数地址
+/// </summary>
+/// <param name="pFileBuffer">FileBuffer</param>
+/// <param name="lpFuncName">函数名</param>
+/// <returns>通过名字导出的函数的地址</returns>
+DWORD GetFunctionAddrByName(IN LPVOID pFileBuffer, IN LPSTR pFunctionOfName)
+{
+	printf("Function Name: %s\n", pFunctionOfName);
+	PIMAGE_DOS_HEADER pDosHeader;
+	PIMAGE_NT_HEADERS pNTHeader;
+	PIMAGE_FILE_HEADER pPEHeader;
+	PIMAGE_OPTIONAL_HEADER32 pOptionHeader;
+	PIMAGE_SECTION_HEADER pSectionHeader;
+	PIMAGE_DATA_DIRECTORY pDataDirectory;
+	PIMAGE_EXPORT_DIRECTORY pExportDirectory;
+
+	// 判断指针是否有效
+	if (!pFileBuffer)
+	{
+		printf("FileBuffer不是有效的指针!\r\n");
+		return 0;
+	}
+	// 判断是否是有效的MZ标志
+	if (*((PWORD)pFileBuffer) != IMAGE_DOS_SIGNATURE)
+	{
+		printf("FileBuffer不是有效的MZ文件\r\n");
+		return 0;
+	}
+	// 判断是否是一个有效的PE标志
+	pDosHeader = (PIMAGE_DOS_HEADER)pFileBuffer;
+	if (*((PWORD)((DWORD)pFileBuffer + pDosHeader->e_lfanew)) != IMAGE_NT_SIGNATURE)
+	{
+		printf("pFileBuffer不是一个有效的PE标志\r\n");
+		return 0;
+	}
+	//  强制结构体类型转换
+	pNTHeader = (PIMAGE_NT_HEADERS)((DWORD)pFileBuffer + pDosHeader->e_lfanew);
+	pPEHeader = (PIMAGE_FILE_HEADER)((DWORD)pNTHeader + 0x04); // 这里必须强制类型转换
+	pOptionHeader = (PIMAGE_OPTIONAL_HEADER32)((DWORD)pPEHeader + IMAGE_SIZEOF_FILE_HEADER);
+	pSectionHeader = (PIMAGE_SECTION_HEADER)((DWORD)pOptionHeader + pPEHeader->SizeOfOptionalHeader);
+	pDataDirectory = (PIMAGE_DATA_DIRECTORY)pOptionHeader->DataDirectory;
+
+	if (!pDataDirectory->VirtualAddress)
+	{
+		printf("这个程序没有导出表\r\n");
+		return 0;
+	}
+	printf("导出表RVA地址：%#X\r\n", pDataDirectory->VirtualAddress);
+	DWORD Foa_ExportTable = RvaToOffset(pFileBuffer, pDataDirectory->VirtualAddress);
+	printf("导出表FOA地址：%#X\r\n", Foa_ExportTable);
+	pExportDirectory = (PIMAGE_EXPORT_DIRECTORY)((DWORD)pFileBuffer + Foa_ExportTable);
+	//上面操作完成之后，就是通过RVA转换为FOA地址，定位到了导出表的起始位置；
+	if (!debug)
+	{
+		printf("Characteristics: %#X\r\n", pExportDirectory->Characteristics);
+		printf("TimeDateStamp:%#X\r\n", pExportDirectory->TimeDateStamp);
+		printf("MajorVersion: %#X\r\n", pExportDirectory->MajorVersion);
+		printf("MinorVersion: %#X\r\n", pExportDirectory->MinorVersion);
+		printf("Name: %s\r\n", (PVOID)((DWORD)pFileBuffer + RvaToOffset(pFileBuffer, pExportDirectory->Name)));
+		printf("Base: %#X\r\n", pExportDirectory->Base);
+		printf("NumberOfFunctions: %#X\r\n", pExportDirectory->NumberOfFunctions);
+		printf("NumberOfNames: %#X\r\n", pExportDirectory->NumberOfNames);
+		printf("AddressOfFunctions: %#X\r\n", pExportDirectory->AddressOfFunctions);
+		printf("AddressOfNames: %#X\r\n", pExportDirectory->AddressOfNames);
+		printf("AddressOfNameOrdinals: %#X\r\n", pExportDirectory->AddressOfNameOrdinals);
+	}
+	//同样是将导出表函数名称表，序号表，函数地址表对应起始位置的RVA转换为FOA
+	DWORD Foa_AddressOfNames = RvaToOffset(pFileBuffer, pExportDirectory->AddressOfNames);
+	DWORD Foa_AddressOfNameOrdinals = RvaToOffset(pFileBuffer, pExportDirectory->AddressOfNameOrdinals);
+	DWORD Foa_AddressOfFunctions = RvaToOffset(pFileBuffer, pExportDirectory->AddressOfFunctions);
+	if (!debug)
+	{
+		DWORD Foa_Address_Names = (DWORD)pFileBuffer + Foa_AddressOfNames;
+		printf("AddressOfNames Offset Value: %#X\r\n", Foa_Address_Names);//偏移看看有没有内容
+		printf("Foa_AddressOfNames: %#X\r\n", Foa_AddressOfNames);//看看转换后的地址
+		printf("Foa_AddressOfNameOrdinals: %#X\r\n", Foa_AddressOfNameOrdinals);
+		printf("Foa_AddressOfFunctions: %#X\r\n", Foa_AddressOfFunctions);
+	}
+	//1.通过循环确认从导出表函数名称表中找与目标函数名是否相同；如相同，则返回该名字在表中的索引
+	DWORD ordIndex = -1;
+	for (DWORD i = 0; i < pExportDirectory->NumberOfNames; i++)
+	{
+		DWORD nameOffset = *(PDWORD)((DWORD)pFileBuffer + (DWORD)((LPDWORD)Foa_AddressOfNames + i));
+		/*上面得到的nameOffset的参数值的理解：
+		Foa_AddressOfNames的值是0X5223C，这个是FileBuffer下对应的FOA内存偏移地址，通过FileBuffer
+		直接移动到名称地址表(AddressOfNames)的首地址位置;这里有一个重点理解对象，就是我们看到的这些
+		AddressOfNames，AddressOfNameOrdinals，AddressOfFunctions全是RVA地址，然后转换之后的FOA地址
+		都是对应理解为像使用Winhex以16进制形式打开ipmsg.exe文件，然后最左边显示的那一对内存地址；
+		就是我们所说的RVA地址和FOA地址，理解这个，就不难理解上面代码(LPDWORD)Foa_AddressOfNames + i)；
+		她们自己相加实际是以使用Winhex以16进制形式打开ipmsg.exe文件的左边内存地址进行偏移依次找到对应
+		名称地址表AddressOfNames的每个偏移地址，然后使用指针的方式通过* 取出里面对应的每个值，而这每个
+		值也是RVA地址，所以得到的nameOffset的值需要再次转换为FOA地址，再使用文件FileBuffer偏移的方式
+		找到真正的函数名称地址;
+		*/
+		LPSTR nameAddr = (LPSTR)((DWORD)pFileBuffer + RvaToOffset(pFileBuffer, nameOffset));
+		if (!strcmp(nameAddr, pFunctionOfName))
+		{
+			ordIndex = i;
+			break;
+		}
+	}
+	if (ordIndex == -1)
+	{
+		printf("导出表中没有这个函数名称.\n");
+		return 0;
+	}
+	//2.通过获得的索引在导出表序号表中找到对应函数的序号
+	WORD ord = *(PWORD)((DWORD)pFileBuffer + (DWORD)((LPWORD)Foa_AddressOfNameOrdinals + ordIndex));
+
+	if (!debug)
+	{
+		DWORD Foa_AddressNameOrdinals = (DWORD)pFileBuffer + Foa_AddressOfNameOrdinals;
+		printf("AddressOfNameOrdinals Offset Value: %#X\r\n", Foa_AddressNameOrdinals);
+		printf("Foa_AddressOfNameOrdinals: %#X\r\n", Foa_AddressOfNameOrdinals);
+		printf("ordInex in AddressOfNames: %#X\r\n", ordIndex);
+		printf("ordInex in AddressOfNameOrdinals: %#X\r\n", ord);
+	}
+
+	//3.通过序号表中查出来的值，当作下标索引从导出表函数地址表中找函数地址
+	DWORD addr = *(PDWORD)((DWORD)pFileBuffer + (DWORD)((LPDWORD)Foa_AddressOfFunctions + ord));
+	//DWORD Foa_AddrFun = RvaToFileOffset(pFileBuffer, addr);
+
+	return addr;
+}
+
+/// <summary>
+/// 打印输出基址重定位表（基址重定位表位于PE头的DataDirectory数组的第六个元素，数组索引为“5”）
+/// </summary>
+/// <param name="pFileBuffer">FileBuffer</param>
+/// <returns></returns>
+VOID PrintRelocTable(IN LPVOID pFileBuffer)
+{
+    typedef struct _TYPE {
+        WORD Offset : 12;
+        WORD Type : 4;
+    }TYPE,*PTYPE;
+
+    PIMAGE_DOS_HEADER pDos;
+    PIMAGE_NT_HEADERS pNt;
+    PIMAGE_FILE_HEADER pPE;
+    PIMAGE_OPTIONAL_HEADER pOption;
+    PIMAGE_BASE_RELOCATION pBaseReloc;
+
+    if (!pFileBuffer)
+    {
+        printf("FileBuffer对象为空，错误代码：%d\r\n", GetLastError());
+        return;
+    }
+
+    if (*((PWORD)pFileBuffer) != IMAGE_DOS_SIGNATURE)
+    {
+        printf("该文件没有MZ标志\r\n");
+        free(pFileBuffer);
+        return;
+    }
+
+    pDos = (PIMAGE_DOS_HEADER)pFileBuffer;
+    pNt = (PIMAGE_NT_HEADERS)((DWORD)pFileBuffer + pDos->e_lfanew);
+    pPE = (PIMAGE_FILE_HEADER)((DWORD)pNt + 0x04);
+    pOption = &pNt->OptionalHeader;
+    if (RvaToOffset(pFileBuffer, pOption->DataDirectory[5].VirtualAddress) == 0)
+    {
+        // 判断该PE文件没有导出表
+        printf("该PE文件没有\"基址重定位表\"\r\n");
+        return;
+    }
+    // 基址重定位表
+    pBaseReloc = (PIMAGE_BASE_RELOCATION)((DWORD)pFileBuffer + RvaToOffset(pFileBuffer, pOption->DataDirectory[5].VirtualAddress)); 
+    // 定位节表
+    PIMAGE_SECTION_HEADER pSection = IMAGE_FIRST_SECTION(pNt);
+
+    // 解析基址重定位表
+    DWORD dwCount;
+    while (pBaseReloc->SizeOfBlock != 0)
+    {
+        // 找到本0x1000个字节的起始位置    (char*)pBaseReloc + 8 = 该内存页的数据
+        dwCount = (pBaseReloc->SizeOfBlock - 8) / 2;
+        DWORD dwRva = pBaseReloc->VirtualAddress;  
+        PTYPE pRelocArr = (PTYPE)(pBaseReloc + 1);  // 定位到每一个被重定位的函数地址 加1等于加上8个字节
+        printf("节表：%s\n", pSection->Name);
+        printf("RVA:%08X\n", dwRva);
+        printf("项目：%x H / %d D\n", dwCount, dwCount);
+        for (int i = 0; i < dwCount; i++)
+        {
+            DWORD pDataOffset = RvaToOffset(pFileBuffer, pRelocArr[i].Offset + dwRva); 
+            printf("RVA:%08X\n", pRelocArr[i].Offset + dwRva);
+            printf("节表:%s\n", pSection->Name);
+            printf("偏移:%08X\n\n", pDataOffset);
+        }
+        // 找到下一个0x1000字节的结构体
+        pBaseReloc = (PIMAGE_BASE_RELOCATION)((char*)pBaseReloc + pBaseReloc->SizeOfBlock);
+    }
+    printf("当前PE文件一共有：%d块数据\r\n", dwCount + 1);
+
+}
+
+/// <summary>
+/// 移动导出表 （重要知识，以后会用到）
+/// </summary>
+/// <param name="pFileBuffer">新增节后的FileBuffer</param>
+/// <param name="fileSize">新增节后的FileBuffer的大小</param>
+/// <param name="buffer">移动导出表后的FileBuffer</param>
+/// <returns>移动导出表后的FileBuffer的大小</returns>
+DWORD MoveExport(IN LPVOID pFileBuffer, IN DWORD fileSize, OUT LPVOID* buffer)
+{
+    PIMAGE_DOS_HEADER pDos;
+    PIMAGE_NT_HEADERS pNt;
+    PIMAGE_FILE_HEADER pPe;
+    PIMAGE_OPTIONAL_HEADER pOption;
+    PIMAGE_SECTION_HEADER pSection;
+    PIMAGE_EXPORT_DIRECTORY pExp;
+    DWORD dwFileLen = fileSize;
+
+    pDos = (PIMAGE_DOS_HEADER)pFileBuffer;  // 新增节后的FileBuffer
+    pNt = (PIMAGE_NT_HEADERS)((DWORD)pFileBuffer + pDos->e_lfanew);
+    pPe = (PIMAGE_FILE_HEADER)((DWORD)pNt + 0x04);
+    pOption = (PIMAGE_OPTIONAL_HEADER32)((DWORD)pPe + IMAGE_SIZEOF_FILE_HEADER);
+    pSection = (PIMAGE_SECTION_HEADER)((DWORD)pOption + pPe->SizeOfOptionalHeader);
+    pExp = (PIMAGE_EXPORT_DIRECTORY)((DWORD)pFileBuffer + RvaToOffset(pFileBuffer, pOption->DataDirectory[0].VirtualAddress));
+
+    DWORD dwOffset = pSection[pPe->NumberOfSections - 1].PointerToRawData;  // 在文件中新增节的Offset
+    PBYTE pLoc = (PBYTE)((DWORD)pFileBuffer + dwOffset);// 定位到最后一节的起始位置
+    
+    //移动函数地址表 
+    PBYTE pFuncAddr = (PBYTE)((DWORD)pFileBuffer + RvaToOffset(pFileBuffer, pExp->AddressOfFunctions));
+    DWORD size_AddressOfFunctions = pExp->NumberOfFunctions * 4;
+    memcpy(pLoc, pFuncAddr, size_AddressOfFunctions);
+
+    //移动函数序号表
+    PBYTE pOrdinalAddr = (PBYTE)((DWORD)pFileBuffer + RvaToOffset(pFileBuffer, pExp->AddressOfNameOrdinals));
+    DWORD size_AddressOfNameOrdinals = pExp->NumberOfNames * 2;
+    memcpy(pLoc + size_AddressOfFunctions, pOrdinalAddr, size_AddressOfNameOrdinals);
+
+    //移动函数名称地址表
+    PBYTE pFuncNameAddr = (PBYTE)((DWORD)pFileBuffer + RvaToOffset(pFileBuffer, pExp->AddressOfNames));
+    DWORD size_AddressOfNames = pExp->NumberOfNames * 4;
+    memcpy(pLoc + size_AddressOfFunctions + size_AddressOfNameOrdinals, pFuncNameAddr, size_AddressOfNames);
+
+    // 复制所有的函数名
+    WORD wNameCount = pExp->NumberOfNames;// 以名字导出的函数个数
+    WORD i = 0;     // 控制循环的索引
+    int len = 0;    // 名字的长度
+    char* pFuncName = nullptr;  // 函数名字的指针
+    PDWORD z = (PDWORD)((DWORD)pLoc + size_AddressOfFunctions + size_AddressOfNameOrdinals);
+
+    // 循环移动函数名字
+    while (i < wNameCount)
+    {
+        //复制函数名字字符串
+        pFuncName = (char*)((DWORD)pFileBuffer + RvaToOffset(pFileBuffer, *((PDWORD)pFuncNameAddr)));
+        memcpy(pLoc + size_AddressOfFunctions + size_AddressOfNameOrdinals + size_AddressOfNames + len, pFuncName, strlen(pFuncName) + 1);
+        // x:函数名字的RVA
+        DWORD x = OffsetToRva(pFileBuffer, ((DWORD)pLoc + size_AddressOfFunctions + size_AddressOfNameOrdinals + size_AddressOfNames + len)-(DWORD)pFileBuffer);
+        *z = x; // 修正函数名字的地址
+        len += (strlen(pFuncName) + 1);
+        pFuncNameAddr+=4;
+        x += 4;
+        z++;
+        i++;
+    }
+
+    //复制导出表结构
+    DWORD dwNewExpOffset = size_AddressOfFunctions + size_AddressOfNameOrdinals + size_AddressOfNames + len;
+    PIMAGE_EXPORT_DIRECTORY pNewExp = (PIMAGE_EXPORT_DIRECTORY)((DWORD)pLoc + dwNewExpOffset);
+    memcpy(pNewExp, pExp, sizeof(IMAGE_EXPORT_DIRECTORY));
+
+    // 修复IMAGE_EXPORT_DIRECTORY结构中的3个子表
+    pNewExp->AddressOfFunctions = OffsetToRva(pFileBuffer, dwOffset);
+    pNewExp->AddressOfNames = OffsetToRva(pFileBuffer, dwOffset + size_AddressOfFunctions + size_AddressOfNameOrdinals);
+    pNewExp->AddressOfNameOrdinals = OffsetToRva(pFileBuffer, dwOffset + size_AddressOfFunctions);
+
+    // 修复IMAGE_DATA_DIRECTORY的VirtualAddress
+    printf("%x\n", (DWORD)pNewExp - (DWORD)pFileBuffer);
+    pOption->DataDirectory[0].VirtualAddress = OffsetToRva(pFileBuffer, (DWORD)pNewExp - (DWORD)pFileBuffer);
+    memset(pExp, 0, sizeof(IMAGE_EXPORT_DIRECTORY));    // 旧的导出表清零
+
+    *buffer = pFileBuffer;
+    pFileBuffer = NULL;
+
+    return dwFileLen;
+}
+
+
+//===============================================================================================================================================//
+// 测试-解析导出表测试代码
+void TestPrintExport()
+{
+    LPVOID pFileBuffer;
+    ReadPEFile(lpDllFile, &pFileBuffer);
+    PrintExportTable(pFileBuffer);
+}
+// 测试-新增节测试代码
+void TestAddNewSec()
+{
+    LPVOID pFileBuffer;
+    LPVOID pImageBuffer;
+    LPVOID pNewFileBuffer;
+    DWORD fileSize = ReadPEFile(lpFileName, &pFileBuffer);
+    // 新增一个长度为512字节的节到PE文件中
+    //DWORD size = 提升PE头新增节(pFileBuffer, fileSize, 0x200, &pNewFileBuffer);
+    DWORD size = AddNewSec(pFileBuffer,0x200, &pNewFileBuffer);
+    BOOL bRet = SaveData(pNewFileBuffer, lpNewDllFile, size);
+    if (bRet)
+    {
+        printf("保存成功\r\n");
+    }
+    else
+    {
+        printf("保存失败\r\n");
+    }
+
+}
+// 测试-在节的空隙中添加代码
+void TestAddCode()
+{
+    LPVOID pFileBuffer;
+    LPVOID pImageBuffer;
+    LPVOID pNewFileBuffer;
+    DWORD fileSize = ReadPEFile(lpFileName, &pFileBuffer);
+    AddCode(pFileBuffer, 2, ShellCode);
+}
+// 测试-扩展节的空间
+void TestExpandSection()
+{
+    LPVOID pFileBuffer;
+    LPVOID pNewFileBuffer;
+    DWORD fileSize = ReadPEFile(lpFileName, &pFileBuffer);
+    fileSize = SectionExpanded(pFileBuffer, 0x200, &pNewFileBuffer);
+    BOOL bRet = SaveData(pNewFileBuffer,lpNewDllFile, fileSize);
+    if (bRet)
+    {
+        printf("保存成功\r\n");
+    }
+    else
+    {
+        printf("保存失败\r\n");
+    }
+}
+// 测试-打印数据目录信息
+void TestPrintDataDirectory()
+{
+    LPVOID pFileBuffer;
+    ReadPEFile(lpFileName, &pFileBuffer);
+    PrintDataDirectory(pFileBuffer);
+}
+// 测试-打印输出重定位表
+void TestPrintReloc()
+{
+    LPVOID pFileBuffer;
+    ReadPEFile(lpDllFile, &pFileBuffer);
+    PrintRelocTable(pFileBuffer);
+}
+// 测试-移动导出表
+void TestMoveExp()
+{
+    LPVOID pFileBuffer;
+    LPVOID buffer;
+    DWORD fileSize = ReadPEFile(lpDllFile, &pFileBuffer);
+    // 新增节 导出表将被复制到新增节中
+    DWORD newSize = AddNewSec(pFileBuffer,  0x200, &pFileBuffer);
+    DWORD newSize2 = MoveExport(pFileBuffer, newSize, &buffer);
+    // 存盘
+    BOOL bRet = SaveData(pFileBuffer, lpNewDllFile, newSize2);
+    if (bRet)
+    {
+        printf("保存成功\r\n");
+        return;
+    }
+    printf("保存失败\r\n");
+}
+// 测试-移动基址重定位表
+void TestMoveBaseReloc()
+{
+    // TODO: 新增节-->移动基址重定位表
+
+}
+//===============================================================================================================================================//
+
+
+int main()
+{
+    //TestMoveExp();
+    //TestAddNewSec();
+
+
+
+    return 0;
+}
